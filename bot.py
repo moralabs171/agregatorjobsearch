@@ -134,7 +134,7 @@ SYNONYMS: dict[str, str] = {
     # Сервис/прочее
     "охранник": "Sicherheit", "уборщик": "Reinigung", "уборщица": "Reinigung",
     "садовник": "Gärtner", "курьер": "Kurier", "почтальон": "Zusteller",
-    "архитектор": "Architekt", "менеджер": "Manager",
+    "архитектор": "Architekt",
 }
 
 

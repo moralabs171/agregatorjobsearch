@@ -8,7 +8,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -39,7 +39,7 @@ class Subscription:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class Storage:

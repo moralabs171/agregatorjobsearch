@@ -69,7 +69,7 @@ class Config:
     default_arbeitszeit: str
 
     @classmethod
-    def load(cls) -> "Config":
+    def load(cls) -> Config:
         token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
         if not token:
             raise ConfigError(

@@ -85,7 +85,7 @@ class JobListing:
     url: str
 
     @classmethod
-    def from_api(cls, item: dict) -> "JobListing | None":
+    def from_api(cls, item: dict) -> JobListing | None:
         refnr = item.get("refnr")
         if not refnr:
             return None
