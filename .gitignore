@@ -2,6 +2,9 @@
 *.db
 *.db-journal
 *.log
+
+# Личный LaunchAgent с абсолютными путями (используй .template)
+com.jobsbot.chemnitz.plist
 __pycache__/
 *.pyc
 .venv/

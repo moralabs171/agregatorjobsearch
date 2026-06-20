@@ -13,6 +13,9 @@
 - `/unwatch <id>` — удалить подписку
 - Фильтр по типу занятости через `|`: `vz` Vollzeit, `tz` Teilzeit,
   `ho` Homeoffice, `mj` Minijob, `snw` смена/ночь/выходные
+- Поиск на русском: словарь профессий + авто-перевод RU→DE (MyMemory),
+  поэтому можно писать «экономист», «логопед», «кровельщик» и т.п.
+- Выдача постранично по 5 с кнопкой «Показать ещё»
 - Дедупликация: в подписке приходят только новые объявления (SQLite)
 - Приватность: бот отвечает только разрешённым `chat_id`
 
@@ -51,6 +54,21 @@ cp .env.example .env
 
 ```bash
 python bot.py
+```
+
+### Фоновый запуск на macOS (launchd)
+
+```bash
+# 1. Подставь свой путь к проекту вместо __PROJECT_DIR__
+cp com.jobsbot.chemnitz.plist.template ~/Library/LaunchAgents/com.jobsbot.chemnitz.plist
+# отредактируй ~/Library/LaunchAgents/com.jobsbot.chemnitz.plist (замени __PROJECT_DIR__)
+
+# 2. Запусти службу (работает в фоне, перезапуск при падении и старте системы)
+launchctl load ~/Library/LaunchAgents/com.jobsbot.chemnitz.plist
+
+# управление
+launchctl list | grep jobsbot              # статус
+launchctl unload ~/Library/LaunchAgents/com.jobsbot.chemnitz.plist  # стоп
 ```
 
 ## Настройки (`.env`)

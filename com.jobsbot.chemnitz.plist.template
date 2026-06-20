@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Шаблон LaunchAgent для запуска бота в фоне на macOS.
+  Замени __PROJECT_DIR__ на абсолютный путь к проекту, например:
+    /Users/youruser/Desktop/parser
+  Затем:
+    cp com.jobsbot.chemnitz.plist.template ~/Library/LaunchAgents/com.jobsbot.chemnitz.plist
+    # подставь путь в скопированном файле, потом:
+    launchctl load ~/Library/LaunchAgents/com.jobsbot.chemnitz.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jobsbot.chemnitz</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_DIR__/.venv/bin/python</string>
+        <string>__PROJECT_DIR__/bot.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/bot.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/bot.err.log</string>
+</dict>
+</plist>

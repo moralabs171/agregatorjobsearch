@@ -6,7 +6,13 @@ import difflib
 import html
 import logging
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -19,6 +25,7 @@ from telegram.ext import (
 )
 
 import arbeitsagentur as aa
+import translate
 from config import Config
 from storage import Storage, Subscription
 
@@ -29,7 +36,8 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("jobs-bot")
 
-_MAX_RESULTS = 10
+_MAX_RESULTS = 5
+_PAGE_SIZE = 5
 _MAX_MSG_CHARS = 3500
 
 # Подсказки-профессии для кнопок: (подпись, ключевое слово для API).
@@ -46,6 +54,31 @@ CATEGORIES: list[tuple[str, str]] = [
 
 # Порядок кнопок типа занятости.
 AZ_ORDER: list[str] = ["vz", "tz", "ho", "mj", "snw"]
+
+# Подписи постоянной нижней клавиатуры (перехватываются в on_text).
+BTN_SEARCH = "🔍 Поиск вакансий"
+BTN_AUSB = "🎓 Ausbildung"
+BTN_SUBS = "🔔 Мои подписки"
+BTN_HELP = "❓ Команды"
+
+# Команды для меню бота (кнопка «/» рядом с полем ввода).
+BOT_COMMANDS: list[tuple[str, str]] = [
+    ("start", "Меню и помощь"),
+    ("search", "Поиск вакансий: /search слова"),
+    ("ausbildung", "Поиск Ausbildung: /ausbildung слова"),
+    ("watch", "Подписка на новые: /watch job|ausbildung слова"),
+    ("list", "Мои подписки"),
+    ("unwatch", "Удалить подписку: /unwatch id"),
+]
+
+
+def _reply_kb() -> ReplyKeyboardMarkup:
+    """Постоянная клавиатура снизу с быстрым доступом."""
+    return ReplyKeyboardMarkup(
+        [[BTN_SEARCH, BTN_AUSB], [BTN_SUBS, BTN_HELP]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 # Словарь профессий: алиас (рус/нем, в нижнем регистре) -> немецкий запрос для API.
 # Используется для перевода с русского и исправления опечаток.
@@ -83,6 +116,25 @@ SYNONYMS: dict[str, str] = {
     "kraftfahrer": "Berufskraftfahrer", "дальнобойщик": "Berufskraftfahrer",
     # Красота
     "парикмахер": "Friseur", "friseur": "Friseur",
+    "косметолог": "Kosmetiker",
+    # Офисные/экономические
+    "экономист": "Betriebswirt", "юрист": "Jurist", "адвокат": "Rechtsanwalt",
+    "маркетолог": "Marketing", "бухгалтерия": "Buchhaltung",
+    "секретарь": "Sekretär", "ассистент": "Assistent",
+    # Инженерия/техника
+    "инженер": "Ingenieur", "конструктор": "Konstrukteur",
+    "сантехник": "Anlagenmechaniker", "строитель": "Bau",
+    "маляр": "Maler", "плотник": "Tischler", "столяр": "Tischler",
+    # Медицина
+    "врач": "Arzt", "доктор": "Arzt", "медбрат": "Pflege",
+    "стоматолог": "Zahnarzt", "фармацевт": "Apotheker", "аптекарь": "Apotheker",
+    # Образование/языки
+    "учитель": "Lehrer", "преподаватель": "Lehrer",
+    "переводчик": "Übersetzer", "дизайнер": "Designer",
+    # Сервис/прочее
+    "охранник": "Sicherheit", "уборщик": "Reinigung", "уборщица": "Reinigung",
+    "садовник": "Gärtner", "курьер": "Kurier", "почтальон": "Zusteller",
+    "архитектор": "Architekt", "менеджер": "Manager",
 }
 
 
@@ -103,6 +155,19 @@ def _resolve_query(text: str) -> tuple[str, str | None]:
         german = SYNONYMS[match[0]]
         return german, f"Похоже, имелось в виду «{german}». Ищу его."
     return raw, None
+
+
+async def _resolve_query_full(text: str) -> tuple[str, str | None]:
+    """Словарь как быстрый путь, иначе авто-перевод RU->DE для кириллицы."""
+    german, note = _resolve_query(text)
+    if note is not None:
+        return german, note
+    # Слова нет в словаре. Если это кириллица — пробуем перевести на немецкий.
+    if translate.has_cyrillic(german):
+        translated = await translate.translate_ru_de(german)
+        if translated:
+            return translated, f"Перевёл на немецкий: «{translated}»"
+    return german, None
 
 HELP_TEXT = (
     "<b>Бот поиска вакансий и Ausbildung</b>\n"
@@ -204,13 +269,40 @@ def _kb_search(state: dict) -> InlineKeyboardMarkup:
     if az_row:
         rows.append(az_row)
 
+    rows.append([InlineKeyboardButton("🔍 Искать сейчас", callback_data="act:search")])
     rows.append(
         [
-            InlineKeyboardButton("🔍 Искать", callback_data="act:search"),
-            InlineKeyboardButton("🔔 Подписаться", callback_data="act:watch"),
+            InlineKeyboardButton(
+                "🔔 Следить за новыми (раз в час)", callback_data="act:watch"
+            )
         ]
     )
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="nav:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _kb_results(shown: int, total: int) -> InlineKeyboardMarkup:
+    """Компактная панель под результатами: ещё / следить / новый поиск."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if shown < total:
+        remaining = total - shown
+        more = min(_PAGE_SIZE, remaining)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"➡️ Показать ещё {more} (осталось {remaining})",
+                    callback_data="more",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🔔 Следить за новыми (раз в час)", callback_data="act:watch"
+            )
+        ]
+    )
+    rows.append([InlineKeyboardButton("🔍 Новый поиск", callback_data="nav:main")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -300,8 +392,34 @@ async def _run_search(
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(_config(context), update):
         return
-    await update.message.reply_html(HELP_TEXT)
+    await update.message.reply_html(HELP_TEXT, reply_markup=_reply_kb())
     await update.message.reply_text("Что ищем?", reply_markup=_kb_main())
+
+
+async def _send_results_page(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int
+) -> None:
+    """Отправляет следующую страницу (5 шт.) из сохранённых результатов поиска."""
+    results = context.user_data.get("results")
+    if not results or not results.get("listings"):
+        await context.bot.send_message(chat_id, "Сначала выполни поиск.")
+        return
+    listings: list[aa.JobListing] = results["listings"]
+    total = len(listings)
+    offset: int = results.get("offset", 0)
+    page = listings[offset:offset + _PAGE_SIZE]
+    if not page:
+        return
+    await _send_listings(context, chat_id, page)
+    shown = offset + len(page)
+    results["offset"] = shown
+    if shown < total:
+        text = f"Показано {shown} из {total}."
+    else:
+        text = f"Это всё ({total})."
+    await context.bot.send_message(
+        chat_id, text, reply_markup=_kb_results(shown, total)
+    )
 
 
 async def _search_and_send(
@@ -311,7 +429,7 @@ async def _search_and_send(
     offer_type: aa.OfferType,
     times: str | None,
 ) -> None:
-    """Выполняет поиск и отправляет результаты в чат."""
+    """Выполняет поиск, сохраняет результаты и показывает первую страницу."""
     config = _config(context)
     suffix = f" ({_times_label(times)})" if times else ""
     await context.bot.send_message(
@@ -325,12 +443,17 @@ async def _search_and_send(
         )
         return
     if not listings:
-        await context.bot.send_message(chat_id, "Ничего не найдено.")
+        tips = ["😕 Ничего не найдено. Что можно сделать:"]
+        tips.append("• ввести профессию по-немецки (например, Manager, Betriebswirt)")
+        if times:
+            tips.append("• убрать фильтр занятости — он сужает выдачу")
+        tips.append("• попробовать более общее слово")
+        tips.append("• /start — начать заново")
+        await context.bot.send_message(chat_id, "\n".join(tips))
         return
-    await context.bot.send_message(
-        chat_id, f"Найдено: {len(listings)}. Показываю первые:"
-    )
-    await _send_listings(context, chat_id, listings[:_MAX_RESULTS])
+    context.user_data["results"] = {"listings": listings, "offset": 0}
+    await context.bot.send_message(chat_id, f"Найдено: {len(listings)}.")
+    await _send_results_page(context, chat_id)
 
 
 async def _create_subscription(
@@ -368,9 +491,12 @@ async def _handle_search(
             "Допустимо: vz, tz, ho, mj, snw."
         )
         return
-    await _search_and_send(
-        context, update.effective_chat.id, what, offer_type, times
-    )
+    chat_id = update.effective_chat.id
+    if what:
+        what, note = await _resolve_query_full(what)
+        if note:
+            await context.bot.send_message(chat_id, note)
+    await _search_and_send(context, chat_id, what, offer_type, times)
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -403,19 +529,45 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
     chat_id = update.effective_chat.id
+    if query:
+        query, note = await _resolve_query_full(query)
+        if note:
+            await context.bot.send_message(chat_id, note)
     sub_id, listings = await _create_subscription(
         context, chat_id, offer_type, query, times
     )
-
-    details = kind + (f", «{query}»" if query else "")
-    details += f", {_times_label(times)}" if times else ""
-    await update.message.reply_text(
-        f"Подписка #{sub_id} создана ({details}). "
-        f"Сейчас актуально: {len(listings)}. "
-        "Дальше буду присылать только новое."
+    await update.message.reply_html(
+        _subscription_card(
+            _config(context), sub_id, offer_type, query, times, len(listings)
+        )
     )
     if listings:
         await _send_listings(context, chat_id, listings[:_MAX_RESULTS])
+
+
+def _subscription_card(
+    config: Config,
+    sub_id: int,
+    offer_type: aa.OfferType,
+    query: str | None,
+    times: str | None,
+    count: int,
+) -> str:
+    """Наглядная карточка: на что именно оформлена подписка."""
+    return "\n".join(
+        [
+            "✅ <b>Подписка оформлена</b>",
+            "",
+            f"📌 Тип: <b>{_offer_label(int(offer_type))}</b>",
+            f"💼 Профессия: <b>{html.escape(query) if query else 'любая'}</b>",
+            f"🕒 Занятость: <b>{_times_label(times) if times else 'любая'}</b>",
+            f"📍 Город: <b>{html.escape(config.default_city)}</b> "
+            f"({config.default_radius_km} км)",
+            "",
+            f"🔁 Проверяю раз в час — пришлю только новое. Сейчас актуально: <b>{count}</b>",
+            f"🗑 Удалить: /unwatch {sub_id}",
+        ]
+    )
 
 
 def _subscriptions_text(subs: list[Subscription]) -> str:
@@ -507,6 +659,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.edit_message_text("Что ищем?", reply_markup=_kb_main())
         return
 
+    if data == "more":
+        await _close_old_menu(query)
+        await _send_results_page(context, chat_id)
+        return
+
     if data.startswith("type:"):
         state["offer_type"] = int(data.split(":", 1)[1])
         state["query"] = None
@@ -532,7 +689,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context, chat_id, keyword, aa.OfferType(state["offer_type"]),
             _state_times(state),
         )
-        await _send_search_menu(context, chat_id, state)
         return
 
     if data == "act:search":
@@ -541,7 +697,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context, chat_id, state.get("query"),
             aa.OfferType(state["offer_type"]), _state_times(state),
         )
-        await _send_search_menu(context, chat_id, state)
         return
 
     if data == "act:watch":
@@ -551,15 +706,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         sub_id, listings = await _create_subscription(
             context, chat_id, offer_type, state.get("query"), times
         )
-        details = _offer_label(int(offer_type))
-        if state.get("query"):
-            details += f", «{state['query']}»"
-        if times:
-            details += f", {_times_label(times)}"
         await context.bot.send_message(
             chat_id,
-            f"Подписка #{sub_id} создана ({details}). "
-            f"Сейчас актуально: {len(listings)}. Дальше пришлю только новое.",
+            _subscription_card(
+                _config(context), sub_id, offer_type,
+                state.get("query"), times, len(listings),
+            ),
+            parse_mode=ParseMode.HTML,
         )
         await _send_search_menu(context, chat_id, state)
         return
@@ -586,16 +739,35 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         return
     chat_id = update.effective_chat.id
-    query, note = _resolve_query(text)
+    state = _state(context)
+
+    if text == BTN_HELP:
+        await update.message.reply_html(HELP_TEXT, reply_markup=_reply_kb())
+        return
+    if text == BTN_SUBS:
+        subs = await asyncio.to_thread(
+            _storage(context).list_subscriptions, chat_id
+        )
+        await update.message.reply_html(_subscriptions_text(subs))
+        return
+    if text in (BTN_SEARCH, BTN_AUSB):
+        state["offer_type"] = int(
+            aa.OfferType.AUSBILDUNG if text == BTN_AUSB else aa.OfferType.JOB
+        )
+        state["query"] = None
+        await update.message.reply_html(
+            _search_title(state), reply_markup=_kb_search(state)
+        )
+        return
+
+    query, note = await _resolve_query_full(text)
     if note:
         await context.bot.send_message(chat_id, note)
-    state = _state(context)
     state["query"] = query
     await _search_and_send(
         context, chat_id, query,
         aa.OfferType(state["offer_type"]), _state_times(state),
     )
-    await _send_search_menu(context, chat_id, state)
 
 
 async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -640,8 +812,15 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Необработанная ошибка", exc_info=context.error)
 
 
+async def _post_init(app: Application) -> None:
+    """Закрепляет команды в меню бота (кнопка «/» у поля ввода)."""
+    await app.bot.set_my_commands(
+        [BotCommand(cmd, desc) for cmd, desc in BOT_COMMANDS]
+    )
+
+
 def build_application(config: Config) -> Application:
-    app = Application.builder().token(config.bot_token).build()
+    app = Application.builder().token(config.bot_token).post_init(_post_init).build()
     app.bot_data["config"] = config
     app.bot_data["storage"] = Storage(config.db_path)
 
