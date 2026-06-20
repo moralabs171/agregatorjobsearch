@@ -74,15 +74,27 @@ class Storage:
 
     def add_subscription(
         self, chat_id: int, offer_type: int, query: str, arbeitszeit: str
-    ) -> int:
+    ) -> tuple[int, bool]:
+        """Создаёт подписку или возвращает существующую идентичную.
+
+        Возвращает (id, created): created=False, если такая подписка уже была.
+        Защищает от дублей при случайном повторном нажатии.
+        """
         with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM subscriptions WHERE chat_id = ? AND offer_type = ? "
+                "AND query = ? AND arbeitszeit = ?",
+                (chat_id, offer_type, query, arbeitszeit),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"]), False
             cur = conn.execute(
                 "INSERT INTO subscriptions "
                 "(chat_id, offer_type, query, arbeitszeit, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (chat_id, offer_type, query, arbeitszeit, _now()),
             )
-            return int(cur.lastrowid)
+            return int(cur.lastrowid), True
 
     def list_subscriptions(self, chat_id: int) -> list[Subscription]:
         with self._connect() as conn:

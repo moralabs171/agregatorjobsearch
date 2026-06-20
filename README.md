@@ -80,7 +80,8 @@ launchctl unload ~/Library/LaunchAgents/com.jobsbot.chemnitz.plist  # стоп
 | `DEFAULT_CITY` | `Chemnitz` | Город поиска |
 | `DEFAULT_RADIUS_KM` | `25` | Радиус вокруг города |
 | `POLL_INTERVAL_MINUTES` | `60` | Период автопроверки подписок |
-| `PUBLISHED_SINCE_DAYS` | `7` | Глубина поиска вакансий по дате (0–100) |
+| `PUBLISHED_SINCE_DAYS` | `30` | Окно по дате последней публикации для ручного поиска вакансий (0–100) |
 | `AUSBILDUNG_SINCE_DAYS` | `100` | Глубина поиска Ausbildung по дате (0–100) |
+| `SUBSCRIPTION_SINCE_DAYS` | `14` | Окно свежести для уведомлений по подпискам (0–100) |
 | `DEFAULT_ARBEITSZEIT` | (пусто) | Тип занятости по умолчанию: `vz tz ho mj snw` |
 | `DB_PATH` | `jobs.db` | Файл базы SQLite |

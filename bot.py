@@ -68,7 +68,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("ausbildung", "Поиск Ausbildung: /ausbildung слова"),
     ("watch", "Подписка на новые: /watch job|ausbildung слова"),
     ("list", "Мои подписки"),
-    ("unwatch", "Удалить подписку: /unwatch id"),
+    ("unwatch", "Удалить подписку: /unwatch номер"),
 ]
 
 
@@ -178,7 +178,7 @@ HELP_TEXT = (
     "/ausbildung <i>слова</i> — разовый поиск Ausbildung\n"
     "/watch job|ausbildung <i>слова</i> — подписка (проверка раз в час)\n"
     "/list — мои подписки\n"
-    "/unwatch <i>id</i> — удалить подписку\n\n"
+    "/unwatch <i>номер</i> — удалить подписку (номер из /list)\n\n"
     "<b>Фильтр по занятости</b> — допиши через <code>|</code>:\n"
     "<code>vz</code> Vollzeit, <code>tz</code> Teilzeit, "
     "<code>ho</code> Homeoffice, <code>mj</code> Minijob, "
@@ -269,7 +269,12 @@ def _kb_search(state: dict) -> InlineKeyboardMarkup:
     if az_row:
         rows.append(az_row)
 
-    rows.append([InlineKeyboardButton("🔍 Искать сейчас", callback_data="act:search")])
+    rows.append(
+        [
+            InlineKeyboardButton("🔍 Искать все", callback_data="act:search"),
+            InlineKeyboardButton("🆕 Только свежие", callback_data="act:fresh"),
+        ]
+    )
     rows.append(
         [
             InlineKeyboardButton(
@@ -314,8 +319,9 @@ def _search_title(state: dict) -> str:
     if times:
         parts.append(f"Занятость: <b>{html.escape(_times_label(times))}</b>")
     parts.append(
-        "\nВыбери профессию или нажми «Искать». "
-        "Можно также просто написать запрос текстом."
+        "\nВыбери профессию или напиши запрос текстом, затем:\n"
+        "• «🔍 Искать все» — все подходящие вакансии;\n"
+        "• «🆕 Только свежие» — лишь опубликованные за последние дни."
     )
     return "\n".join(parts)
 
@@ -372,13 +378,16 @@ async def _run_search(
     what: str | None,
     offer_type: aa.OfferType,
     arbeitszeit: str | None = None,
+    *,
+    since_days: int | None = None,
 ) -> list[aa.JobListing]:
     config = _config(context)
-    since_days = (
-        config.ausbildung_since_days
-        if offer_type == aa.OfferType.AUSBILDUNG
-        else config.published_since_days
-    )
+    if since_days is None:
+        since_days = (
+            config.ausbildung_since_days
+            if offer_type == aa.OfferType.AUSBILDUNG
+            else config.published_since_days
+        )
     return await aa.search(
         what=what,
         where=config.default_city,
@@ -428,15 +437,31 @@ async def _search_and_send(
     what: str | None,
     offer_type: aa.OfferType,
     times: str | None,
+    *,
+    fresh: bool = False,
 ) -> None:
-    """Выполняет поиск, сохраняет результаты и показывает первую страницу."""
+    """Выполняет поиск, сохраняет результаты и показывает первую страницу.
+
+    fresh=True использует узкое окно подписки (только свежие объявления).
+    """
     config = _config(context)
+    since_days = config.subscription_since_days if fresh else None
     suffix = f" ({_times_label(times)})" if times else ""
-    await context.bot.send_message(
-        chat_id, f"Ищу {_offer_label(int(offer_type))} в {config.default_city}{suffix}…"
-    )
+    if fresh:
+        await context.bot.send_message(
+            chat_id,
+            f"Ищу свежие {_offer_label(int(offer_type))} за последние "
+            f"{config.subscription_since_days} дн. в {config.default_city}{suffix}…",
+        )
+    else:
+        await context.bot.send_message(
+            chat_id,
+            f"Ищу {_offer_label(int(offer_type))} в {config.default_city}{suffix}…",
+        )
     try:
-        listings = await _run_search(context, what, offer_type, times)
+        listings = await _run_search(
+            context, what, offer_type, times, since_days=since_days
+        )
     except aa.ArbeitsagenturError:
         await context.bot.send_message(
             chat_id, "Не удалось получить данные от сервиса. Попробуй позже."
@@ -444,6 +469,8 @@ async def _search_and_send(
         return
     if not listings:
         tips = ["😕 Ничего не найдено. Что можно сделать:"]
+        if fresh:
+            tips.append("• нажать «🔍 Искать все» — окно свежести узкое")
         tips.append("• ввести профессию по-немецки (например, Manager, Betriebswirt)")
         if times:
             tips.append("• убрать фильтр занятости — он сужает выдачу")
@@ -452,7 +479,12 @@ async def _search_and_send(
         await context.bot.send_message(chat_id, "\n".join(tips))
         return
     context.user_data["results"] = {"listings": listings, "offset": 0}
-    await context.bot.send_message(chat_id, f"Найдено: {len(listings)}.")
+    found = (
+        f"🆕 Найдено свежих (за {config.subscription_since_days} дн.): {len(listings)}."
+        if fresh
+        else f"Найдено: {len(listings)}."
+    )
+    await context.bot.send_message(chat_id, found)
     await _send_results_page(context, chat_id)
 
 
@@ -462,18 +494,41 @@ async def _create_subscription(
     offer_type: aa.OfferType,
     query: str | None,
     times: str | None,
-) -> tuple[int, list[aa.JobListing]]:
-    """Создаёт подписку и помечает текущие результаты как уже показанные."""
+) -> tuple[int, list[aa.JobListing], bool]:
+    """Создаёт подписку и помечает текущие результаты как уже показанные.
+
+    Возвращает (id, listings, created). Если идентичная подписка уже есть,
+    created=False и повторного поиска/пометки не делаем (защита от дублей).
+    """
     storage = _storage(context)
-    sub_id = await asyncio.to_thread(
+    sub_id, created = await asyncio.to_thread(
         storage.add_subscription, chat_id, int(offer_type), query or "", times or ""
     )
+    if not created:
+        return sub_id, [], False
     try:
-        listings = await _run_search(context, query, offer_type, times)
+        listings = await _run_search(
+            context,
+            query,
+            offer_type,
+            times,
+            since_days=_config(context).subscription_since_days,
+        )
     except aa.ArbeitsagenturError:
         listings = []
     await asyncio.to_thread(storage.mark_seen, sub_id, [i.refnr for i in listings])
-    return sub_id, listings
+    return sub_id, listings, True
+
+
+async def _subscription_number(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, sub_id: int
+) -> int:
+    """Порядковый номер подписки для пользователя (1, 2, 3…), не внутренний id."""
+    subs = await asyncio.to_thread(_storage(context).list_subscriptions, chat_id)
+    for number, sub in enumerate(subs, start=1):
+        if sub.id == sub_id:
+            return number
+    return len(subs)
 
 
 async def _handle_search(
@@ -533,12 +588,18 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         query, note = await _resolve_query_full(query)
         if note:
             await context.bot.send_message(chat_id, note)
-    sub_id, listings = await _create_subscription(
+    sub_id, listings, created = await _create_subscription(
         context, chat_id, offer_type, query, times
     )
+    number = await _subscription_number(context, chat_id, sub_id)
+    if not created:
+        await update.message.reply_html(
+            _subscription_exists_card(number, offer_type, query, times)
+        )
+        return
     await update.message.reply_html(
         _subscription_card(
-            _config(context), sub_id, offer_type, query, times, len(listings)
+            _config(context), number, offer_type, query, times, len(listings)
         )
     )
     if listings:
@@ -547,7 +608,7 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def _subscription_card(
     config: Config,
-    sub_id: int,
+    number: int,
     offer_type: aa.OfferType,
     query: str | None,
     times: str | None,
@@ -565,7 +626,27 @@ def _subscription_card(
             f"({config.default_radius_km} км)",
             "",
             f"🔁 Проверяю раз в час — пришлю только новое. Сейчас актуально: <b>{count}</b>",
-            f"🗑 Удалить: /unwatch {sub_id}",
+            f"🗑 Удалить: /unwatch {number}",
+        ]
+    )
+
+
+def _subscription_exists_card(
+    number: int,
+    offer_type: aa.OfferType,
+    query: str | None,
+    times: str | None,
+) -> str:
+    """Сообщение, когда такая подписка уже есть — без создания дубля."""
+    return "\n".join(
+        [
+            "ℹ️ <b>Такая подписка уже есть</b> — дубликат не создаю.",
+            "",
+            f"📌 Тип: <b>{_offer_label(int(offer_type))}</b>",
+            f"💼 Профессия: <b>{html.escape(query) if query else 'любая'}</b>",
+            f"🕒 Занятость: <b>{_times_label(times) if times else 'любая'}</b>",
+            "",
+            f"🗑 Удалить: /unwatch {number}",
         ]
     )
 
@@ -574,13 +655,13 @@ def _subscriptions_text(subs: list[Subscription]) -> str:
     if not subs:
         return "Подписок нет. Создай кнопкой «🔔 Подписаться» или командой /watch."
     lines = []
-    for sub in subs:
-        line = f"#{sub.id}: {_offer_label(sub.offer_type)}"
+    for number, sub in enumerate(subs, start=1):
+        line = f"№{number}: {_offer_label(sub.offer_type)}"
         if sub.query:
             line += f" · «{html.escape(sub.query)}»"
         if sub.arbeitszeit:
             line += f" · {html.escape(_times_label(sub.arbeitszeit))}"
-        line += f"   (удалить: /unwatch {sub.id})"
+        line += f"   (удалить: /unwatch {number})"
         lines.append(line)
     return "<b>Подписки:</b>\n" + "\n".join(lines)
 
@@ -599,17 +680,22 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not _is_allowed(config, update):
         return
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Формат: /unwatch <id> (см. /list).")
+        await update.message.reply_text("Формат: /unwatch <номер> (см. /list).")
         return
-    sub_id = int(context.args[0])
+    number = int(context.args[0])
     chat_id = update.effective_chat.id
+    storage = _storage(context)
+    subs = await asyncio.to_thread(storage.list_subscriptions, chat_id)
+    if not 1 <= number <= len(subs):
+        await update.message.reply_text("Нет подписки с таким номером. См. /list.")
+        return
     removed = await asyncio.to_thread(
-        _storage(context).remove_subscription, chat_id, sub_id
+        storage.remove_subscription, chat_id, subs[number - 1].id
     )
     if removed:
-        await update.message.reply_text(f"Подписка #{sub_id} удалена.")
+        await update.message.reply_text(f"Подписка №{number} удалена.")
     else:
-        await update.message.reply_text("Такой подписки нет.")
+        await update.message.reply_text("Не удалось удалить. См. /list.")
 
 
 async def _refresh_search_screen(query, state: dict) -> None:
@@ -699,20 +785,34 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    if data == "act:fresh":
+        await _close_old_menu(query)
+        await _search_and_send(
+            context, chat_id, state.get("query"),
+            aa.OfferType(state["offer_type"]), _state_times(state),
+            fresh=True,
+        )
+        return
+
     if data == "act:watch":
         offer_type = aa.OfferType(state["offer_type"])
         times = _state_times(state)
         await _close_old_menu(query)
-        sub_id, listings = await _create_subscription(
+        sub_id, listings, created = await _create_subscription(
             context, chat_id, offer_type, state.get("query"), times
         )
-        await context.bot.send_message(
-            chat_id,
-            _subscription_card(
-                _config(context), sub_id, offer_type,
+        number = await _subscription_number(context, chat_id, sub_id)
+        if created:
+            card = _subscription_card(
+                _config(context), number, offer_type,
                 state.get("query"), times, len(listings),
-            ),
-            parse_mode=ParseMode.HTML,
+            )
+        else:
+            card = _subscription_exists_card(
+                number, offer_type, state.get("query"), times
+            )
+        await context.bot.send_message(
+            chat_id, card, parse_mode=ParseMode.HTML
         )
         await _send_search_menu(context, chat_id, state)
         return
@@ -789,6 +889,7 @@ async def _poll_one(
             sub.query or None,
             aa.OfferType(sub.offer_type),
             sub.arbeitszeit or None,
+            since_days=_config(context).subscription_since_days,
         )
     except aa.ArbeitsagenturError:
         logger.warning("Подписка #%s: API недоступно, пропускаю", sub.id)
@@ -801,9 +902,10 @@ async def _poll_one(
         return
     await asyncio.to_thread(storage.mark_seen, sub.id, list(new_refnrs))
     fresh = [by_refnr[r] for r in new_refnrs]
+    number = await _subscription_number(context, sub.chat_id, sub.id)
     await context.bot.send_message(
         chat_id=sub.chat_id,
-        text=f"🔔 Новое по подписке #{sub.id}: {len(fresh)}",
+        text=f"🔔 Новое по подписке №{number}: {len(fresh)}",
     )
     await _send_listings(context, sub.chat_id, fresh[:_MAX_RESULTS])
 
